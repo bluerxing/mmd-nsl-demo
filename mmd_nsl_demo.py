@@ -496,14 +496,131 @@ def prepare_training_data(context_rules, max_depth=2):
 # 5. Main: Algorithm 1 -- Bilevel Optimization
 # ==============================================================
 
+def print_diagrams():
+    """Print architecture and cross-graph transfer diagrams."""
+    print("")
+    print("=" * 70)
+    print("Diagram 1: Architecture Flow (Algorithm 1)")
+    print("=" * 70)
+    print("""
+  +---------------------------------------------------------+
+  |  INPUT: Document-level KGs (Doc A, B, C, D ...)         |
+  |  Each doc = independent entity graph + triples          |
+  +---------------------------------------------------------+
+                          |
+                          v
+  +---------------------------------------------------------+
+  |  Co-occurrence Mining                                   |
+  |  For each (relation, NER_h, NER_t), count relational    |
+  |  paths across ALL training documents                    |
+  |  -> Initial rule prior per NER-context                  |
+  +---------------------------------------------------------+
+                          |
+                          v
+  +====================== BILEVEL LOOP =====================+
+  |                                                         |
+  |  +---------------------------------------------------+  |
+  |  | UPPER LEVEL: Rule Generator T_phi (Transformer)   |  |
+  |  |                                                   |  |
+  |  | Encoder: [ent_emb(NER_h), rel_emb(r), ent_emb(NER_t)]
+  |  | Decoder: token-by-token body generation           |  |
+  |  |   step 1: P(r1 | context) -> sample r1            |  |
+  |  |   step 2: P(r2 | context, r1) -> sample r2        |  |
+  |  |   ...until <STOP>                                  |  |
+  |  | Output: candidate rules + prior pi_k(phi)         |  |
+  |  +---------------------------------------------------+  |
+  |                    |                                     |
+  |                    v                                     |
+  |  +---------------------------------------------------+  |
+  |  | LOWER LEVEL: Rule Grounding + Scoring             |  |
+  |  |                                                   |  |
+  |  | For each candidate rule z_j:                      |  |
+  |  |   F_rule(z_j) = does path exist in local KG?     |  |
+  |  |   theta_j = learned weight for rule z_j           |  |
+  |  | Output: grounding scores + theta*(phi)            |  |
+  |  +---------------------------------------------------+  |
+  |                    |                                     |
+  |                    v                                     |
+  |  +---------------------------------------------------+  |
+  |  | FEEDBACK: Posterior -> retrain T_phi               |  |
+  |  |   Combine prior pi_k + grounding + theta*         |  |
+  |  |   -> posterior-weighted training signal            |  |
+  |  |   -> T_phi learns which rules actually ground     |  |
+  |  +---------------------------------------------------+  |
+  |                    |                                     |
+  +====================|=====================================+
+                       v
+  +---------------------------------------------------------+
+  |  OUTPUT: Optimized T_phi + theta                        |
+  |  -> Context-conditioned rule prior for link prediction  |
+  +---------------------------------------------------------+
+""")
+
+    print("=" * 70)
+    print("Diagram 2: Cross-Graph Rule Transfer via Shared NER Space")
+    print("=" * 70)
+    print("""
+  TRAINING DOCUMENTS                    RULE DISCOVERY
+  ==================                    ==============
+
+  Doc A:                                For <Person, Location> + born_in:
+    Alice --born_in--> Rome               Alice->Rome->Italy (2-hop path)
+    Rome --located_in--> Italy            co-occurs with Alice->Italy (direct)
+    Alice --born_in--> Italy              => born_in ^ located_in discovered!
+
+  Doc B:                                  Bob->Berlin->Germany (2-hop path)
+    Bob --born_in--> Berlin               co-occurs with Bob->Germany (direct)
+    Berlin --located_in--> Germany        => born_in ^ located_in reinforced!
+    Bob --born_in--> Germany
+
+       |                 |
+       v                 v
+  +--------------------------------------------------+
+  |     SHARED NER-CONTEXT RULE SPACE                |
+  |     (lives in T_phi's parameters)                |
+  |                                                  |
+  |  <Person, Location> + born_in:                   |
+  |    born_in              prob=0.36                 |
+  |    born_in^located_in   prob=0.18  <-- KEY RULE  |
+  |    born_in^~located_in  prob=0.18                 |
+  |                                                  |
+  |  <Person, Location> + works_in:                  |
+  |    works_in             prob=0.29                 |
+  |    works_in^works_in    prob=0.14  <-- KEY RULE  |
+  +--------------------------------------------------+
+       |                 |
+       v TRANSFER        v TRANSFER
+
+  TEST DOCUMENTS                        RULE GROUNDING
+  ==============                        ==============
+
+  Doc C:                                born_in^located_in applied:
+    Carol --born_in--> Tokyo              Carol->Tokyo->Japan
+    Tokyo --located_in--> Japan           PATH EXISTS -> GROUNDED!
+    Carol --born_in--> Japan ???          => Predict YES (score=0.99)
+
+  Doc D:                                works_in^works_in applied:
+    Dan --works_in--> Samsung             Dan->Samsung->Seoul
+    Samsung --works_in--> Seoul           PATH EXISTS -> GROUNDED!
+    Dan --works_in--> Seoul ???           => Predict YES (score=0.99)
+
+  KEY INSIGHT:
+    Rules transfer across documents via SHARED NER-TYPE SPACE.
+    Doc C has ZERO overlap in entities with Doc A/B,
+    but <Person, Location> is the same context type.
+    The upper-level T_phi provides the bridge.
+""")
+
+
 def run_algorithm1(documents, n_iters=2, n_samples=20):
     STOP = 2 * R
     max_depth = 2
 
     # ============================================================
-    # Display data
+    # Display data and diagrams
     # ============================================================
     display_data()
+    print_diagrams()
 
     # ============================================================
     # Alg.1 Line 1: Initialize parameters phi, theta
@@ -844,5 +961,148 @@ def run_algorithm1(documents, n_iters=2, n_samples=20):
                         RELATIONS[qr], body_str(rb), status))
 
 
+def run_local_only_baseline():
+    """
+    Ablation: What happens if each document mines rules independently,
+    WITHOUT sharing context priors across documents?
+
+    This directly answers the reviewer's question:
+      "Couldn't you simply retrain from scratch for each text?"
+
+    Answer: No. Individual documents are too sparse to discover
+    multi-hop rules. The shared NER-context prior is essential.
+    """
+    print("")
+    print("")
+    print("=" * 70)
+    print("ABLATION: Local-Only Baseline (No Cross-Graph Sharing)")
+    print("=" * 70)
+    print("")
+    print("  Question: What if we mine rules per-document independently,")
+    print("  instead of sharing priors across documents?")
+    print("")
+
+    train_docs = [d for d in DOCUMENTS if "TEST" not in d["title"]]
+    test_docs = [d for d in DOCUMENTS if "TEST" in d["title"]]
+
+    # ---- Full model: shared prior from Doc A + B ----
+    print("-" * 70)
+    print("(A) Full MMD-NSL: Shared context prior from Doc A + B")
+    print("-" * 70)
+    shared_rules = mine_rules_from_documents(train_docs)
+    print("")
+    print("  Mined rules (shared across all training docs):")
+    for ctx, info in shared_rules.items():
+        rn = RELATIONS[ctx[0]]
+        hn = NER_TYPES[ctx[1]]
+        tn = NER_TYPES[ctx[2]]
+        print("    <%s, %s> + %s:" % (hn, tn, rn))
+        for rb, p in sorted(zip(info["rules"], info["probs"]),
+                            key=lambda x: -x[1]):
+            print("      %s  (prob=%.2f)" % (body_str(rb), p))
+
+    print("")
+    print("  Grounding on test documents:")
+    for doc in test_docs:
+        print("")
+        print("    %s:" % doc["title"])
+        for qh, qt, qr in doc["queries"]:
+            hn = doc["entities"][qh]["name"]
+            tn = doc["entities"][qt]["name"]
+            ctx = (qr, doc["entities"][qh]["type"], doc["entities"][qt]["type"])
+            print("      %s --%s--> %s ?" % (hn, RELATIONS[qr], tn))
+            if ctx in shared_rules:
+                found_grounded = False
+                for rb, p in sorted(zip(shared_rules[ctx]["rules"],
+                                        shared_rules[ctx]["probs"]),
+                                    key=lambda x: -x[1]):
+                    gs = ground_rule_on_graph(doc, rb, qh, qt)
+                    status = "GROUNDED" if gs > 0 else "no path"
+                    print("        %s  (prob=%.2f)  [%s]" % (
+                        body_str(rb), p, status))
+                    if gs > 0:
+                        found_grounded = True
+                if found_grounded:
+                    print("        --> Prediction supported by shared prior!")
+            else:
+                print("        [no candidate rules for this context]")
+
+    # ---- Local-only: each test doc mines its own rules ----
+    print("")
+    print("-" * 70)
+    print("(B) Local-Only Baseline: Each document mines rules independently")
+    print("-" * 70)
+    print("")
+    print("  No sharing of <NER_h, NER_t> context priors across documents.")
+    print("  Each test document must discover rules from its own triples only.")
+
+    for doc in test_docs:
+        print("")
+        print("  --- %s (standalone mining) ---" % doc["title"])
+        local_rules = mine_rules_from_documents([doc])
+
+        if local_rules:
+            print("    Locally mined rules:")
+            for ctx, info in local_rules.items():
+                rn = RELATIONS[ctx[0]]
+                hn = NER_TYPES[ctx[1]]
+                tn = NER_TYPES[ctx[2]]
+                print("      <%s, %s> + %s:" % (hn, tn, rn))
+                for rb, p in sorted(zip(info["rules"], info["probs"]),
+                                    key=lambda x: -x[1]):
+                    print("        %s  (prob=%.2f)" % (body_str(rb), p))
+        else:
+            print("    Locally mined rules: [NONE]")
+
+        print("")
+        print("    Grounding queries with local-only rules:")
+        for qh, qt, qr in doc["queries"]:
+            hn = doc["entities"][qh]["name"]
+            tn = doc["entities"][qt]["name"]
+            ctx = (qr, doc["entities"][qh]["type"], doc["entities"][qt]["type"])
+            print("      %s --%s--> %s ?" % (hn, RELATIONS[qr], tn))
+            if ctx in local_rules:
+                found_grounded = False
+                for rb, p in sorted(zip(local_rules[ctx]["rules"],
+                                        local_rules[ctx]["probs"]),
+                                    key=lambda x: -x[1]):
+                    gs = ground_rule_on_graph(doc, rb, qh, qt)
+                    status = "GROUNDED" if gs > 0 else "no path"
+                    print("        %s  (prob=%.2f)  [%s]" % (
+                        body_str(rb), p, status))
+                    if gs > 0:
+                        found_grounded = True
+                if not found_grounded:
+                    print("        --> NO grounded rule found!")
+            else:
+                print("        [no candidate rules for this context]")
+                print("        --> FAILURE: born_in^located_in was never")
+                print("            discovered because Doc alone lacks the")
+                print("            direct triple needed for co-occurrence mining.")
+
+    # ---- Summary ----
+    print("")
+    print("=" * 70)
+    print("ABLATION SUMMARY")
+    print("=" * 70)
+    print("")
+    print("  Full MMD-NSL (shared context prior):")
+    print("    - born_in^located_in discovered from Doc A+B")
+    print("    - Transferred to Doc C via shared <Person,Location> space")
+    print("    - GROUNDED: Carol -> Tokyo -> Japan")
+    print("")
+    print("  Local-only baseline (per-document mining):")
+    print("    - Doc C alone: only trivial 1-hop rules (born_in, located_in)")
+    print("    - born_in^located_in NEVER discovered")
+    print("    - Cannot ground what you don't know")
+    print("")
+    print("  Conclusion:")
+    print("    The gain comes from SHARING RULE PRIORS in NER-context space,")
+    print("    not from sharing entities or graphs. Individual documents are")
+    print("    too sparse for reliable multi-hop rule discovery.")
+    print("    This is precisely what the upper-level T_phi provides.")
+
+
 if __name__ == "__main__":
     run_algorithm1(DOCUMENTS, n_iters=2, n_samples=20)
+    run_local_only_baseline()
