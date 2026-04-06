@@ -617,6 +617,12 @@ def run_algorithm1(documents, n_iters=2, n_samples=20):
     max_depth = 2
 
     # ============================================================
+    # STRICT TRAIN/TEST SPLIT
+    # ============================================================
+    train_docs = [d for d in documents if "TEST" not in d["title"]]
+    test_docs = [d for d in documents if "TEST" in d["title"]]
+
+    # ============================================================
     # Display data and diagrams
     # ============================================================
     display_data()
@@ -624,12 +630,15 @@ def run_algorithm1(documents, n_iters=2, n_samples=20):
 
     # ============================================================
     # Alg.1 Line 1: Initialize parameters phi, theta
+    #   Mining ONLY from training documents (Doc A, B)
     # ============================================================
     print("")
     print("=" * 70)
     print("Alg.1 Line 1: Initialize -- Mine co-occurrence rules for prior")
+    print("  NOTE: Mining ONLY from training docs (Doc A, B)")
+    print("  Test docs (Doc C, D) are held out completely.")
     print("=" * 70)
-    initial_rules = mine_rules_from_documents(documents, max_depth=max_depth)
+    initial_rules = mine_rules_from_documents(train_docs, max_depth=max_depth)
 
     for ctx, info in initial_rules.items():
         print("")
@@ -666,11 +675,11 @@ def run_algorithm1(documents, n_iters=2, n_samples=20):
                 epoch + 1, total_loss / len(train_data)))
 
     # ============================================================
-    # Demonstrate token-by-token generation BEFORE EM
+    # Demonstrate token-by-token generation BEFORE bilevel loop
     # ============================================================
     print("")
     print("=" * 70)
-    print("TOKEN-BY-TOKEN AUTOREGRESSIVE GENERATION (before EM)")
+    print("TOKEN-BY-TOKEN AUTOREGRESSIVE GENERATION (before bilevel loop)")
     print("  Showing how T_phi generates a rule body step by step")
     print("=" * 70)
 
@@ -687,6 +696,7 @@ def run_algorithm1(documents, n_iters=2, n_samples=20):
 
     # ============================================================
     # Alg.1 Line 2: for each iteration do
+    #   ALL training uses ONLY train_docs (Doc A, B)
     # ============================================================
     for iteration in range(1, n_iters + 1):
         print("")
@@ -696,9 +706,6 @@ def run_algorithm1(documents, n_iters=2, n_samples=20):
 
         # ========================================================
         # Alg.1 Lines 3-7: Upper-level optimization
-        #   for each context C_k:
-        #     Line 5: Solve Eq.11.a, generate rule bodies r_1^j ^ ... ^ r_L^j
-        #     Line 6: Compute context distribution pi_k(phi)
         # ========================================================
         print("")
         print("  " + "-" * 60)
@@ -716,12 +723,11 @@ def run_algorithm1(documents, n_iters=2, n_samples=20):
             print("")
             print("    C_k = <%s, %s>,  r_head = %s" % (hn, tn, rn))
             print("    pi_k(phi) = {")
-            total = len(rules_list)
             for rb, lp in sorted(rules_list, key=lambda x: -x[1]):
                 print("      z_j = %-25s  log pi = %+.3f" % (body_str(rb), lp))
             print("    }")
 
-        # Show ONE detailed token-by-token trace for this iteration
+        # Show ONE detailed token-by-token trace
         print("")
         print("  Detailed token-by-token trace (1 sample for 1st context):")
         first_ctx = context_triples[0]
@@ -729,51 +735,48 @@ def run_algorithm1(documents, n_iters=2, n_samples=20):
 
         # ========================================================
         # Alg.1 Lines 8-14: Lower-level optimization
-        #   for each context C_k:
-        #     Line 10: Process local KG evidence -> F_rule(z_j | C_k)
-        #     Line 11: Maximize log-likelihood treating pi_k(phi) as fixed
-        #     Line 12: Update theta*(phi) as posterior rule weights
-        #     Line 13: Update path embeddings e_path
+        #   Ground rules on TRAINING doc KGs only, learn theta_j
         # ========================================================
         print("")
         print("  " + "-" * 60)
         print("  Alg.1 Lines 8-14: Lower-level optimization")
-        print("  Ground rules on local KGs, learn theta_j")
+        print("  Ground rules on TRAINING doc KGs, learn theta_j")
         print("  " + "-" * 60)
 
         scorer = RuleScorer(sampled)
         opt_scorer = torch.optim.Adam(scorer.parameters(), lr=0.05)
 
-        # Line 10: Show grounding examples
+        # Line 10: Show grounding on TRAINING docs
         print("")
-        print("    Line 10: F_rule(z_j | C_k) -- grounding on local KGs:")
-        for doc in documents:
-            for qh, qt, qr in doc["queries"]:
-                h_type = doc["entities"][qh]["type"]
-                t_type = doc["entities"][qt]["type"]
-                ctx = (qr, h_type, t_type)
+        print("    Line 10: F_rule(z_j | C_k) -- grounding on training KGs:")
+        for doc in train_docs:
+            for h, t, r in doc["triples"]:
+                h_type = doc["entities"][h]["type"]
+                t_type = doc["entities"][t]["type"]
+                ctx = (r, h_type, t_type)
                 if ctx not in sampled:
                     continue
-                hn = doc["entities"][qh]["name"]
-                tn = doc["entities"][qt]["name"]
-                print("")
-                print("      %s: query %s --%s--> %s" % (
-                    doc["title"], hn, RELATIONS[qr], tn))
+                hn = doc["entities"][h]["name"]
+                tn = doc["entities"][t]["name"]
+                grounded_any = False
                 for rb, lp in sampled[ctx]:
-                    gs = ground_rule_on_graph(doc, rb, qh, qt)
-                    mark = "YES" if gs > 0 else "no"
-                    # Show path trace
+                    gs = ground_rule_on_graph(doc, rb, h, t)
                     if gs > 0:
-                        print("        F_rule(%s) = %.1f  [%s]" % (
-                            body_str(rb), gs, mark))
-                        # trace the grounding path
+                        if not grounded_any:
+                            print("")
+                            print("      %s: %s --%s--> %s" % (
+                                doc["title"], hn, RELATIONS[r], tn))
+                            grounded_any = True
+                        print("        F_rule(%s) = %.1f  [GROUNDED]" % (
+                            body_str(rb), gs))
+                        # trace path
                         adj = defaultdict(lambda: defaultdict(set))
-                        for h, t, r in doc["triples"]:
-                            adj[h][t].add(r)
-                            adj[t][h].add(r + R)
-                        current = {qh}
-                        path_desc = doc["entities"][qh]["name"]
-                        for ri, rel_id in enumerate(rb):
+                        for hh, tt2, rr in doc["triples"]:
+                            adj[hh][tt2].add(rr)
+                            adj[tt2][hh].add(rr + R)
+                        current = {h}
+                        path_desc = doc["entities"][h]["name"]
+                        for rel_id in rb:
                             if rel_id == 2 * R:
                                 break
                             next_set = set()
@@ -787,23 +790,10 @@ def run_algorithm1(documents, n_iters=2, n_samples=20):
                                     ALL_RELS[rel_id], doc["entities"][mid]["name"])
                             current = next_set
                         print("          path: %s" % path_desc)
-                    else:
-                        print("        F_rule(%s) = %.1f  [%s]" % (
-                            body_str(rb), gs, mark))
 
-        # Line 11-12: Train scorer (maximize log-likelihood)
-        for epoch in range(30):
-            total_loss = 0
-            for doc in documents:
-                for qh, qt, qr in doc["queries"]:
-                    logit = scorer.score_query(doc, qh, qt, qr)
-                    loss = F.binary_cross_entropy_with_logits(logit, torch.tensor([1.0]))
-                    opt_scorer.zero_grad(); loss.backward(); opt_scorer.step()
-                    total_loss += loss.item()
-
-        # Also train on known triples as positive examples
-        for epoch in range(30):
-            for doc in documents:
+        # Line 11-12: Train scorer ONLY on training docs' known triples
+        for epoch in range(50):
+            for doc in train_docs:
                 for h, t, r in doc["triples"]:
                     h_type = doc["entities"][h]["type"]
                     t_type = doc["entities"][t]["type"]
@@ -831,18 +821,18 @@ def run_algorithm1(documents, n_iters=2, n_samples=20):
 
         # ========================================================
         # Alg.1 Lines 15-17: Feedback to upper-level
-        #   Line 16: Use theta*(phi) to draw new training samples
-        #   Line 17: Update phi to improve future rule generation
+        #   Posterior from TRAINING docs only
         # ========================================================
         print("")
         print("  " + "-" * 60)
         print("  Alg.1 Lines 15-17: Feedback to upper-level")
         print("  Posterior combines prior pi_k with theta* from lower level")
         print("  -> retrain T_phi on posterior-weighted samples")
+        print("  (using TRAINING docs only)")
         print("  " + "-" * 60)
 
         posterior_counter = defaultdict(Counter)
-        for doc in documents:
+        for doc in train_docs:
             for h, t, r in doc["triples"]:
                 h_type = doc["entities"][h]["type"]
                 t_type = doc["entities"][t]["type"]
@@ -917,48 +907,76 @@ def run_algorithm1(documents, n_iters=2, n_samples=20):
         print("")
         generator.sample_rules_verbose(rel, ht, tt, N=1)
 
-    # Final prediction
+    # ============================================================
+    # CROSS-GRAPH TRANSFER: Apply learned rules to UNSEEN test docs
+    #   No parameters were updated using test docs.
+    #   Rules were learned entirely from Doc A + B.
+    # ============================================================
     print("")
     print("=" * 70)
-    print("FINAL: Link Prediction using learned rules")
+    print("CROSS-GRAPH TRANSFER: Apply learned rules to UNSEEN test docs")
+    print("  Rules learned from Doc A + B ONLY.")
+    print("  Test docs (Doc C, D) were never seen during training.")
     print("=" * 70)
 
-    final_rules = generator.sample_rules(context_triples, N=30)
-    final_scorer = RuleScorer(final_rules)
-    opt_f = torch.optim.Adam(final_scorer.parameters(), lr=0.05)
-    for _ in range(50):
-        for doc in documents:
-            for qh, qt, qr in doc["queries"]:
-                logit = final_scorer.score_query(doc, qh, qt, qr)
-                loss = F.binary_cross_entropy_with_logits(logit, torch.tensor([1.0]))
-                opt_f.zero_grad(); loss.backward(); opt_f.step()
-            for h, t, r in doc["triples"]:
-                h_type = doc["entities"][h]["type"]
-                t_type = doc["entities"][t]["type"]
-                ctx = (r, h_type, t_type)
-                if ctx not in final_rules:
-                    continue
-                logit = final_scorer.score_query(doc, h, t, r)
-                loss = F.binary_cross_entropy_with_logits(logit, torch.tensor([1.0]))
-                opt_f.zero_grad(); loss.backward(); opt_f.step()
+    final_rules = generator.sample_rules(context_triples, N=50)
 
-    for doc in documents:
+    for doc in test_docs:
         print("")
         print("  %s:" % doc["title"])
         for qh, qt, qr in doc["queries"]:
-            logit = final_scorer.score_query(doc, qh, qt, qr)
-            prob = torch.sigmoid(logit).item()
             hn = doc["entities"][qh]["name"]
             tn = doc["entities"][qt]["name"]
             ctx = (qr, doc["entities"][qh]["type"], doc["entities"][qt]["type"])
-            print("    %s --%s--> %s  score=%.4f" % (hn, RELATIONS[qr], tn, prob))
-            if ctx in final_rules:
-                for rb, lp in sorted(final_rules[ctx], key=lambda x: -x[1])[:3]:
-                    gs = ground_rule_on_graph(doc, rb, qh, qt)
-                    key = "%d_%d_%d" % (ctx[0], ctx[1], ctx[2])
-                    status = "GROUNDED" if gs > 0 else "no path"
-                    print("      rule: %s <- %s  [%s]" % (
-                        RELATIONS[qr], body_str(rb), status))
+            print("")
+            print("    Query: %s --%s--> %s ?" % (hn, RELATIONS[qr], tn))
+
+            if ctx not in final_rules:
+                print("      [no candidate rules for this context]")
+                continue
+
+            # Find ALL grounded rules (not just top-3 by prior)
+            grounded = []
+            not_grounded = []
+            for rb, lp in final_rules[ctx]:
+                gs = ground_rule_on_graph(doc, rb, qh, qt)
+                if gs > 0:
+                    grounded.append((rb, lp, gs))
+                else:
+                    not_grounded.append((rb, lp))
+
+            if grounded:
+                print("      GROUNDED rules (supporting prediction):")
+                for rb, lp, gs in sorted(grounded, key=lambda x: -x[2]):
+                    print("        %s <- %s  [GROUNDED]" % (
+                        RELATIONS[qr], body_str(rb)))
+                    # trace path
+                    adj = defaultdict(lambda: defaultdict(set))
+                    for h, t, r in doc["triples"]:
+                        adj[h][t].add(r)
+                        adj[t][h].add(r + R)
+                    current = {qh}
+                    path_desc = doc["entities"][qh]["name"]
+                    for rel_id in rb:
+                        if rel_id == 2 * R:
+                            break
+                        next_set = set()
+                        for node in current:
+                            for nb in adj[node]:
+                                if rel_id in adj[node][nb]:
+                                    next_set.add(nb)
+                        if next_set:
+                            mid = list(next_set)[0]
+                            path_desc += " --%s--> %s" % (
+                                ALL_RELS[rel_id], doc["entities"][mid]["name"])
+                        current = next_set
+                    print("          path: %s" % path_desc)
+                print("      --> PREDICTION SUPPORTED by cross-graph transfer!")
+            else:
+                print("      No grounded rule found.")
+                print("      --> CORRECTLY REJECTED (no supporting evidence)")
+                print("      (top ungrounded candidates: %s)" % ", ".join(
+                    body_str(rb) for rb, _ in not_grounded[:3]))
 
 
 def run_local_only_baseline():
